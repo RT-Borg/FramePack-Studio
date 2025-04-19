@@ -28,6 +28,8 @@ from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_pro
 from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
+from diffusers.loaders import AttnProcsLayers
+from diffusers.models.attention_processor import LoRAAttnProcessor
 
 
 parser = argparse.ArgumentParser()
@@ -209,9 +211,61 @@ def parse_timestamped_prompt(prompt_text, total_duration, latent_window_size=9):
     
     return reversed_sections
 
+# Add this function after parse_timestamped_prompt function but before the worker function
+@torch.no_grad()
+def load_lora(transformer, lora_path, lora_weight=1.0):
+    if not lora_path or lora_path.lower() == "none":
+        return transformer
+    
+    # Load LoRA weights
+    lora_state_dict = {}
+    
+    if lora_path.endswith(".safetensors"):
+        lora_state_dict = sf.load_file(lora_path)
+    else:
+        lora_state_dict = torch.load(lora_path, map_location="cpu")
+    
+    # Get attention processors
+    attn_procs = {}
+    for name in transformer.attn_processors.keys():
+        cross_attention_dim = None if name.endswith("attn1.processor") else transformer.config.cross_attention_dim
+        if name.startswith("mid_block"):
+            hidden_size = transformer.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(transformer.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = transformer.config.block_out_channels[block_id]
+        
+        attn_procs[name] = LoRAAttnProcessor(
+            hidden_size=hidden_size,
+            cross_attention_dim=cross_attention_dim,
+            rank=4,
+        )
+    
+    # Set attention processors
+    transformer.set_attn_processor(attn_procs)
+    
+    # Load LoRA weights with scaling
+    lora_layers = AttnProcsLayers(transformer.attn_processors)
+    lora_layers.load_state_dict(lora_state_dict)
+    
+    # Scale weights
+    if lora_weight != 1.0:
+        for module in lora_layers.modules():
+            if isinstance(module, LoRAAttnProcessor):
+                module.to_q_lora.weight.data *= lora_weight
+                module.to_k_lora.weight.data *= lora_weight
+                module.to_v_lora.weight.data *= lora_weight
+                module.to_out_lora.weight.data *= lora_weight
+    
+    return transformer
+
+
 
 @torch.no_grad()
-def worker(input_image, prompt_text, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache):
+def worker(input_image, prompt_text, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, lora_path, lora_weight):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -301,6 +355,10 @@ def worker(input_image, prompt_text, n_prompt, seed, total_second_length, latent
 
         # Sampling
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
+
+        if lora_path and lora_path != "None":
+            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Applying LoRA weights...'))))
+            transformer = load_lora(transformer, lora_path, lora_weight)
 
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
@@ -471,8 +529,7 @@ def worker(input_image, prompt_text, n_prompt, seed, total_second_length, latent
     stream.output_queue.push(('end', None))
     return
 
-
-def process(input_image, prompt_text, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache):
+def process(input_image, prompt_text, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, lora_path, lora_weight):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -480,7 +537,7 @@ def process(input_image, prompt_text, n_prompt, seed, total_second_length, laten
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt_text, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache)
+    async_run(worker, input_image, prompt_text, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, lora_path, lora_weight)
 
     output_filename = None
 
@@ -517,6 +574,12 @@ quick_prompts = [
     '[0s-1.1s: Person looks surprised] [1.1s-2.2s: Person raises arms above head] [2.2s-3.3s: Person puts hands on hips]'
 ]
 quick_prompts = [[x] for x in quick_prompts]
+
+# Lora directory
+lora_dir = "./loras/"
+os.makedirs(lora_dir, exist_ok=True)
+lora_files = [os.path.join(lora_dir, f) for f in os.listdir(lora_dir) 
+              if f.endswith((".safetensors", ".pt", ".bin"))]
 
 
 css = make_progress_bar_css()
@@ -563,6 +626,11 @@ with block:
 
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
 
+            with gr.Group():
+                lora_dropdown = gr.Dropdown(choices=["None"] + lora_files, value="None", label="Select LoRA")
+                lora_weight = gr.Slider(label="LoRA Weight", minimum=0.0, maximum=2.0, value=1.0, step=0.01)
+
+
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
             result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=False, height=512, loop=True)
@@ -581,8 +649,10 @@ with block:
             """)
     
     # Connect the main process
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache]
+
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, lora_dropdown, lora_weight]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
+
     end_button.click(fn=end_process)
 
 
