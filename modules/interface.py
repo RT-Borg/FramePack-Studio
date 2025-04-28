@@ -49,7 +49,7 @@ def create_interface(
     }
     """
 
-    block = gr.Blocks(css=css, theme="soft").queue()
+    block = gr.Blocks(css=css, title="FramePack Studio", theme="soft").queue()
     
     with block:
         gr.Markdown('# FramePack Studio')
@@ -58,13 +58,22 @@ def create_interface(
             with gr.TabItem("Generate"):
                 with gr.Row():
                     with gr.Column():
-                        input_image = gr.Image(
-                            sources='upload',
-                            type="numpy",
-                            label="Image (optional)",
-                            height=420,
-                            elem_classes="contain-image"
-                        )
+                        with gr.Row():
+                            input_image = gr.Image(
+                                sources='upload',
+                                type="numpy",
+                                label="Image (optional)",
+                                height=420,
+                                elem_classes="contain-image"
+                            )
+                        
+                            end_image = gr.Image(
+                                sources='upload',
+                                type="numpy",
+                                label="End Image (optional)",
+                                height=420,
+                                elem_classes="contain-image"
+                            )
 
                         with gr.Accordion("Latent Image Options", open=False):
 
@@ -190,7 +199,7 @@ def create_interface(
             return int(time.time())
         
         # Connect the main process function
-        ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, randomize_seed, save_metadata, blend_sections, latent_type]
+        ips = [input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, randomize_seed, save_metadata, blend_sections, latent_type]
         
         # Add LoRA values to inputs if any exist
         if lora_values:
@@ -199,11 +208,11 @@ def create_interface(
         # Modified process function that updates the queue status after adding a job
         def process_with_queue_update(*args):
             # Extract all arguments
-            input_image, prompt_text, n_prompt, seed_value, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, randomize_seed_checked, save_metadata_checked, blend_sections, latent_type, *lora_args = args
+            input_image, end_image, prompt_text, n_prompt, seed_value, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, randomize_seed_checked, save_metadata_checked, blend_sections, latent_type, *lora_args = args
             
             # Use the current seed value as is for this job
             # Call the process function with all arguments
-            result = process_fn(input_image, prompt_text, n_prompt, seed_value, total_second_length, 
+            result = process_fn(input_image, end_image, prompt_text, n_prompt, seed_value, total_second_length, 
                             latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, 
                             use_teacache, mp4_crf, save_metadata_checked, blend_sections, latent_type, *lora_args)
             

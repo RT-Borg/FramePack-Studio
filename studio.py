@@ -222,7 +222,9 @@ def load_lora_file(lora_file):
 
 @torch.no_grad()
 def worker(
-    input_image, 
+    input_image,
+    end_image,
+    has_end_image,
     prompt_text, 
     n_prompt, 
     seed, 
@@ -314,13 +316,16 @@ def worker(
         H, W, C = input_image.shape
         height, width = find_nearest_bucket(H, W, resolution=640)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
+        
+        if has_end_image:
+            end_image_np = resize_and_center_crop(end_image, target_width=width, target_height=height)
 
         if save_metadata:
             metadata = PngInfo()
             metadata.add_text("prompt", prompt_text)
             metadata.add_text("seed", str(seed))
             Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'), pnginfo=metadata)
-
+            Image.fromarray(end_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'), pnginfo=metadata)
             metadata_dict = {
                 "prompt": prompt_text,
                 "seed": seed,
@@ -346,6 +351,11 @@ def worker(
 
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
+        
+        if has_end_image:
+            end_image_pt = torch.from_numpy(end_image_np).float() / 127.5 - 1
+            end_image_pt = end_image_pt.permute(2, 0, 1)[None, :, None]
+
 
         # VAE encoding
         stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
@@ -354,6 +364,8 @@ def worker(
             load_model_as_complete(vae, target_device=gpu)
 
         start_latent = vae_encode(input_image_pt, vae)
+        if has_end_image:
+            end_latent = vae_encode(end_image_pt, vae)
 
         # CLIP Vision
         stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
@@ -363,6 +375,12 @@ def worker(
 
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+
+        if has_end_image:
+            end_image_encoder_output = hf_clip_vision_encode(end_image_np, feature_extractor, image_encoder)
+            end_image_encoder_last_hidden_state = end_image_encoder_output.last_hidden_state
+            # Combine both image embeddings or use a weighted approach
+            image_encoder_last_hidden_state = (image_encoder_last_hidden_state + end_image_encoder_last_hidden_state) / 2
 
         # Dtype
         for prompt_key in encoded_prompts:
@@ -392,9 +410,11 @@ def worker(
 
         # PROMPT BLENDING: Track section index
         section_idx = 0
+        latent_paddings = list(reversed(range(total_latent_sections)))
 
         for latent_padding in latent_paddings:
             is_last_section = latent_padding == 0
+            is_first_section = latent_padding == latent_paddings[0]
             latent_padding_size = latent_padding * latent_window_size
 
             if stream_to_use.input_queue.top() == 'end':
@@ -458,7 +478,7 @@ def worker(
             if original_time_position < 0:
                 original_time_position = 0
 
-            print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}, '
+            print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}, is_first_section = {is_first_section}, '
                   f'time position: {current_time_position:.2f}s (original: {original_time_position:.2f}s), '
                   f'using prompt: {current_prompt[:60]}...')
 
@@ -469,6 +489,10 @@ def worker(
             clean_latents_pre = start_latent.to(history_latents)
             clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+
+            if has_end_image and is_first_section:
+                clean_latents_post = end_latent.to(history_latents)
+                clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
             if not high_vram:
                 unload_complete_models()
@@ -604,12 +628,14 @@ def worker(
 job_queue.set_worker_function(worker)
 
 
-def process(input_image, prompt_text, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, save_metadata,blend_sections, latent_type, *lora_values):
+def process(input_image, end_image, prompt_text, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, save_metadata,blend_sections, latent_type, *lora_values):
     
     # Create a blank black image if no 
     # Create a default image based on the selected latent_type
+
+    default_height, default_width = 640, 640
+
     if input_image is None:
-        default_height, default_width = 640, 640
         if latent_type == "White":
             # Create a white image
             input_image = np.ones((default_height, default_width, 3), dtype=np.uint8) * 255
@@ -633,10 +659,26 @@ def process(input_image, prompt_text, n_prompt, seed, total_second_length, laten
             input_image = np.zeros((default_height, default_width, 3), dtype=np.uint8)
             print(f"No input image provided. Using a blank black image (latent_type: {latent_type}).")
 
+
+
+    # End Image
+    has_end_image = end_image is not None
+    if has_end_image:
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Processing end frame ...'))))
+
+        H_end, W_end, C_end = end_image.shape
+        end_image_np = resize_and_center_crop(end_image, target_width=default_width, target_height=default_height)
+        end_image_pt = torch.from_numpy(end_image_np).float() / 127.5 - 1
+        end_image_pt = end_image_pt.permute(2, 0, 1)[None, :, None]
+    else:
+        end_image = np.ones((default_height, default_width, 3), dtype=np.uint8) * 255
+
     
     # Create job parameters
     job_params = {
-        'input_image': input_image.copy(),  # Make a copy to avoid reference issues
+        'input_image': input_image.copy(),
+        'end_image': end_image.copy(),
+        'has_end_image': has_end_image,
         'prompt_text': prompt_text,
         'n_prompt': n_prompt,
         'seed': seed,
